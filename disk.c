@@ -2,7 +2,6 @@
 #include "taskxtinfo.h"
 #include <linux/kernel.h>
 
-
 ssize_t write_vaddr_disk(void *, size_t);
 int setup_disk(void);
 void cleanup_disk(void);
@@ -30,15 +29,15 @@ int setup_disk() {
 	log_to_file("[TaskXT] setup_disk starting");
 	
 	if (dio && reopen) {	
-		f = filp_open(filepath, O_WRONLY | O_CREAT | O_LARGEFILE | O_SYNC | O_DIRECT, 0444);
+		f = filp_open(filepath, O_WRONLY | O_CREAT | O_APPEND | O_LARGEFILE | O_SYNC | O_DIRECT, 0644);
 	} else if (dio) {
-		f = filp_open(filepath, O_WRONLY | O_CREAT | O_LARGEFILE | O_TRUNC | O_SYNC | O_DIRECT, 0444);
+		f = filp_open(filepath, O_WRONLY | O_CREAT | O_APPEND | O_LARGEFILE | O_SYNC | O_DIRECT, 0644);
 	}
 	
 	if(!dio || (f == ERR_PTR(-EINVAL))) {
 		DBG("Direct IO Disabled");
 		pr_info("[TaskXT] setup_disk: opening without DIO\n");
-		f = filp_open(filepath, O_WRONLY | O_CREAT | O_LARGEFILE | O_TRUNC, 0644);
+		f = filp_open(filepath, O_WRONLY | O_CREAT | O_APPEND | O_LARGEFILE, 0644);
 		dio = 0;
 	}
 

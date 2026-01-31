@@ -1,5 +1,5 @@
-# TaskXT V3 - Linux Task Feature Extractor
-# Ported for Linux Kernel 6.18.3+
+# TaskXT V4 - Linux Task Feature Extractor
+# Ported for Linux Kernel 6.18
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
