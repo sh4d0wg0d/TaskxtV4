@@ -1,0 +1,18 @@
+
+*.ko
+*.o
+*.mod.c
+*.mod
+*.cmd
+*.md
+*.pkg.tar.zst
+README
+Module.symvers 
+Module.markers 
+modules.order 
+\.*.o.cmd 
+\.*.ko.cmd 
+\.*.o.d *.mod
+PORTING_NOTES.md
+PORTING_SUMMARY.md
+CHANGELOG.md
