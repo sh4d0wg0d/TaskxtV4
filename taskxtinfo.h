@@ -26,9 +26,13 @@
 
 
 
+#define MAX_SAMPLES 10000  // Maximum number of samples per process
+#define SAMPLE_BUFFER_SIZE (MAX_SAMPLES * 150)  // ~150 bytes per sample with formatting
+
 typedef struct {
-   char pid[5000000];
+   char *pid;  // Dynamically allocated buffer
    int cnt;
+   int allocated_size;  // Track allocated buffer size for bounds checking
 //	unsigned int magic;
 //	unsigned int version;
 //	unsigned long long s_addr;

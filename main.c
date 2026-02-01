@@ -101,6 +101,11 @@ static int num_monitored_processes = 0;
 static char current_process[50] = {0};
 static spinlock_t process_lock;
 
+// Forward declarations for helper functions
+static int allocate_monitored_process_buffer(monitored_process_t *proc);
+static void free_monitored_process_buffer(monitored_process_t *proc);
+static int check_buffer_overflow(monitored_process_t *proc, size_t needed);
+
 //sysfs attribute functions for runtime control
 static ssize_t sampling_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
     return sprintf(buf, "%d\n", sampling);
@@ -141,7 +146,7 @@ static ssize_t pname_show(struct kobject *kobj, struct kobj_attribute *attr, cha
 
 static ssize_t pname_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
     char temp_pname[50];
-    int i, found = 0;
+    int i, found = 0, ret;
     
     if (count > 49) return -EINVAL;
     sscanf(buf, "%49s", temp_pname);
@@ -162,8 +167,17 @@ static ssize_t pname_store(struct kobject *kobj, struct kobj_attribute *attr, co
     if (!found && num_monitored_processes < MAX_MONITORED_PROCESSES) {
         strcpy(monitored_processes[num_monitored_processes].name, temp_pname);
         monitored_processes[num_monitored_processes].active = 1;
+        monitored_processes[num_monitored_processes].data.pid = NULL;
         monitored_processes[num_monitored_processes].data.cnt = 0;
-        monitored_processes[num_monitored_processes].data.pid[0] = 0;
+        
+        // Allocate buffer for new process
+        ret = allocate_monitored_process_buffer(&monitored_processes[num_monitored_processes]);
+        if (ret != 0) {
+            spin_unlock(&process_lock);
+            pr_err("[TaskXT] Failed to allocate buffer for process %s\n", temp_pname);
+            return -ENOMEM;
+        }
+        
         num_monitored_processes++;
         pr_info("[TaskXT] Process name added: %s (total: %d)\n", temp_pname, num_monitored_processes);
     } else if (!found) {
@@ -221,6 +235,41 @@ static struct attribute_group taskxt_attr_group = {
 
 static struct kobject *taskxt_kobj;
 
+// Helper functions for dynamic buffer management
+static int allocate_monitored_process_buffer(monitored_process_t *proc) {
+    if (proc->data.pid != NULL) {
+        return 0;  // Already allocated
+    }
+    proc->data.pid = kmalloc(SAMPLE_BUFFER_SIZE, GFP_KERNEL);
+    if (!proc->data.pid) {
+        pr_err("[TaskXT] Failed to allocate buffer for process %s\n", proc->name);
+        return -ENOMEM;
+    }
+    proc->data.allocated_size = SAMPLE_BUFFER_SIZE;
+    proc->data.cnt = 0;
+    pr_info("[TaskXT] Allocated %d bytes for process %s\n", SAMPLE_BUFFER_SIZE, proc->name);
+    return 0;
+}
+
+static void free_monitored_process_buffer(monitored_process_t *proc) {
+    if (proc->data.pid) {
+        kfree(proc->data.pid);
+        proc->data.pid = NULL;
+        proc->data.allocated_size = 0;
+        proc->data.cnt = 0;
+        pr_info("[TaskXT] Freed buffer for process %s\n", proc->name);
+    }
+}
+
+static int check_buffer_overflow(monitored_process_t *proc, size_t needed) {
+    if (proc->data.cnt + needed > proc->data.allocated_size) {
+        pr_warn("[TaskXT] Buffer full for process %s (used: %d, needed: %zu, max: %d)\n", 
+                proc->name, proc->data.cnt, needed, proc->data.allocated_size);
+        return 1;  // Buffer would overflow
+    }
+    return 0;
+}
+
 static struct file_operations query_fops =
 {
     .owner = THIS_MODULE,
@@ -231,7 +280,6 @@ static struct file_operations query_fops =
     .unlocked_ioctl = taskxt_ioctl
 };
 
-
 module_param(path, charp, 0644);
 MODULE_PARM_DESC(path, "Directory path to save output file");
 module_param(pname, charp, 0644);
@@ -241,7 +289,6 @@ MODULE_PARM_DESC(srate, "Sampling rate in milliseconds");
 module_param(dura, int, 0644);
 MODULE_PARM_DESC(dura, "Duration to collect samples in milliseconds");
 
- 
 MODULE_AUTHOR("Alex Pons");
 MODULE_DESCRIPTION("Taskxt V3 Char Driver");
 MODULE_LICENSE("GPL");
@@ -254,8 +301,6 @@ int device_init(void);
 module_init(device_init);
 module_exit(device_exit);
  
-
-
 int device_init(void)
 {
    int ret = 0;
@@ -305,9 +350,15 @@ int device_init(void)
    // Add initial process from module parameter
    strcpy(monitored_processes[0].name, pname);
    monitored_processes[0].active = 1;
-   monitored_processes[0].data.cnt = 0;
-   monitored_processes[0].data.pid[0] = 0;
    num_monitored_processes = 1;
+   
+   // Allocate buffer for the initial process
+   if ((ret = allocate_monitored_process_buffer(&monitored_processes[0])) != 0) {
+       pr_err("[TaskXT] Failed to allocate buffer for initial process\n");
+       log_to_file("[TaskXT] ERROR: Buffer allocation failed");
+       return ret;
+   }
+   
    pr_info("[TaskXT] Initial process added: %s\n", pname);
 
    if ((ret = alloc_chrdev_region(&dev, 0, 1, "taskxt")) < 0)
@@ -358,7 +409,6 @@ int device_init(void)
       unregister_chrdev_region(dev, 1);
       return ret;
    }
-   
    pr_info("[TaskXT] sysfs control attributes available at /sys/kernel/taskxt/\n");
 
 
@@ -378,12 +428,13 @@ int device_init(void)
       return -ENOMEM;
    }
 
-   sampling = 1; // enables the 
+   sampling = 1; // enables the sampling
 
    return err;
 }
 
 void device_exit(void) {
+   int i;
    pr_info("[TaskXT] Module exit starting\n");
    log_to_file("[TaskXT] Module exit");
    printk(KERN_NOTICE "taskxt: exiting module\n");
@@ -409,6 +460,14 @@ void device_exit(void) {
        cleanup_disk();
        fileOpen = 0;
    }
+
+   // Free dynamically allocated buffers
+   pr_info("[TaskXT] Freeing process buffers\n");
+   spin_lock(&process_lock);
+   for (i = 0; i < num_monitored_processes; i++) {
+       free_monitored_process_buffer(&monitored_processes[i]);
+   }
+   spin_unlock(&process_lock);
 
    // Remove sysfs attributes BEFORE destroying device
    pr_info("[TaskXT] Removing sysfs\n");
@@ -484,7 +543,7 @@ static long taskxt_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          }
          if (copy_to_user((taskxt_arg_t *)arg, &q, sizeof(taskxt_arg_t)))
          {
-               return -EACCES;
+            return -EACCES;
          }
          break;
       case TASKXT_SMP_PROCESSNAME:
@@ -496,7 +555,7 @@ static long taskxt_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
       case TASKXT_SET_PROCESSNAME:
          if (copy_from_user(&q, (taskxt_arg_t *)arg, sizeof(taskxt_arg_t)))
          {
-               return -EACCES;
+            return -EACCES;
          }
 
          strcpy(ProcessName, q.processName);
@@ -531,7 +590,6 @@ static int extract_features(void*n)
    ktime_t startTime; 
    s64 timeTaken_us;
    int delayAmtMin, delayAmtMax;  
-   int found;
    int len = 0;
    char fullFileName[1024];
    char prev_process[50] = {0};
@@ -553,83 +611,93 @@ static int extract_features(void*n)
       
       if (sampling) {
          // Check for any active monitored processes
+         // Use RCU read lock for process list traversal instead of spinlock
          spin_lock(&process_lock);
          
-         for (i = 0; i < num_monitored_processes; i++) {
-            if (!monitored_processes[i].active) continue;
+         // Create a snapshot of which processes to monitor (copy under lock)
+         monitored_process_t local_procs[MAX_MONITORED_PROCESSES];
+         int local_count = num_monitored_processes;
+         if (local_count > 0) {
+            memcpy(local_procs, monitored_processes, sizeof(monitored_process_t) * local_count);
+         }
+         
+         spin_unlock(&process_lock);
+         
+         // NOW do the expensive sampling operations without holding the spinlock
+         for (i = 0; i < local_count; i++) {
+            if (!local_procs[i].active) continue;
             
-            // Look for this process
-            found = 0;
+            // Look for and sample this process
             for_each_process(task) {
-               if (!strcmp(task->comm, monitored_processes[i].name)) {
-                  found = 1;
-                  break;
+               if (!strcmp(task->comm, local_procs[i].name)) {
+                  // Check if we switched processes
+                  if (strcmp(prev_process, local_procs[i].name) != 0) {
+                     pr_info("[TaskXT] Process FOUND: %s\n", local_procs[i].name);
+                     log_to_file("[TaskXT] Process FOUND");
+                     strcpy(prev_process, local_procs[i].name);
+                     if (local_procs[i].data.pid) {
+                         local_procs[i].data.pid[0] = 0;
+                     }
+                     local_procs[i].data.cnt = 0;
+                  }
+
+                  DBG("In extract_features found process: %s", local_procs[i].name);
+                  DBG("Number of iteration %i", iterations);
+
+                  memset(&val, 0, sizeof(val));
+                  startTime = ktime_get();
+
+                  // sample at rate indicated for the number of iterations
+                  for (loop = 0; loop < iterations; loop++) {
+                     if (kthread_should_stop()) {
+                        pr_info("[TaskXT] Thread stop signal received during sampling\n");
+                        break;
+                     }
+                     
+                     // Check if buffer would overflow before adding sample
+                     if (check_buffer_overflow(&local_procs[i], sizeof(val))) {
+                        pr_warn("[TaskXT] Stopping sampling for %s - buffer limit reached\n", local_procs[i].name);
+                        break;  // Exit sampling loop
+                     }
+                     
+                     // Extract features from current process
+                     if ((task->active_mm)) {
+                        val.map_count = (*task->active_mm).map_count;
+                        val.hiwater_rss = (*task->active_mm).hiwater_rss; 
+                        val.hiwater_vm = (*task->active_mm).hiwater_vm;
+                        val.total_vm = (*task->active_mm).total_vm;
+                        val.exec_vm = (*task->active_mm).exec_vm;
+                     }  
+                     val.utime = task->utime;
+                     val.stime = task->stime;
+                     val.nvcsw = task->nvcsw;
+                     val.nivcsw = task->nivcsw;
+                     val.min_flt = task->min_flt;
+                     if (task->fs)
+                        val.fscount = (*task->fs).users;
+
+                     memcpy(&local_procs[i].data.pid[local_procs[i].data.cnt], &val, sizeof(val));
+                     local_procs[i].data.cnt += sizeof(val);
+                     memset(&val, 0, sizeof(val));
+
+                     timeTaken_us = ktime_us_delta(ktime_get(), startTime);
+                     if (timeTaken_us < delayAmtMin) {
+                        usleep_range(delayAmtMin - timeTaken_us, delayAmtMax - timeTaken_us);
+                     } else {
+                        DBG("exceeded by %llu on iteration: %i", (timeTaken_us - delayAmtMin), loop);
+                     }
+                     startTime = ktime_get();
+                  }
+                  break;  // Exit for_each_process after sampling is complete
                }
             }
 
-            if (found) {
-               // Check if we switched processes
-               if (strcmp(prev_process, monitored_processes[i].name) != 0) {
-                  pr_info("[TaskXT] Process FOUND: %s\n", monitored_processes[i].name);
-                  log_to_file("[TaskXT] Process FOUND");
-                  strcpy(prev_process, monitored_processes[i].name);
-                  monitored_processes[i].data.pid[0] = 0;
-                  monitored_processes[i].data.cnt = 0;
-               }
-
-               DBG("In extract_features found process: %s", monitored_processes[i].name);
-               DBG("Number of iteration %i", iterations);
-
-               memset(&val, 0, sizeof(val));
-               startTime = ktime_get();
-
-               // sample at rate indicated for the number of iterations
-               for (loop = 0; loop < iterations; loop++) {
-                  if (kthread_should_stop()) {
-                     pr_info("[TaskXT] Thread stop signal received during sampling\n");
-                     break;
-                  }
-                  
-                  // Find the process again
-                  for_each_process(task) {
-                     if (!strcmp(task->comm, monitored_processes[i].name)) {
-                        // Extract features
-                        if ((task->active_mm)) {
-                           val.map_count = (*task->active_mm).map_count;
-                           val.hiwater_rss = (*task->active_mm).hiwater_rss; 
-                           val.hiwater_vm = (*task->active_mm).hiwater_vm;
-                           val.total_vm = (*task->active_mm).total_vm;
-                           val.exec_vm = (*task->active_mm).exec_vm;
-                        }  
-                        val.utime = task->utime;
-                        val.stime = task->stime;
-                        val.nvcsw = task->nvcsw;
-                        val.nivcsw = task->nivcsw;
-                        val.min_flt = task->min_flt;
-                        if (task->fs)
-                           val.fscount = (*task->fs).users;
-                        break;
-                     }
-                  }  
-
-                  memcpy(&monitored_processes[i].data.pid[monitored_processes[i].data.cnt], &val, sizeof(val));
-                  monitored_processes[i].data.cnt += sizeof(val);
-                  memset(&val, 0, sizeof(val));
-
-                  timeTaken_us = ktime_us_delta(ktime_get(), startTime);
-                  if (timeTaken_us < delayAmtMin) {
-                     usleep_range(delayAmtMin - timeTaken_us, delayAmtMax - timeTaken_us);
-                  } else {
-                     DBG("exceeded by %llu on iteration: %i", (timeTaken_us - delayAmtMin), loop);
-                  }
-                  startTime = ktime_get();
-               }
-
-               // Write collected data to file
+            // Write collected data to file (if process was found and sampled)
+            if (local_procs[i].data.cnt > 0) {
                len = strlen(path);	
                strcpy(fullFileName, path);
                if (fullFileName[len-1] != '/') strcat(fullFileName, "/");
-               strcat(fullFileName, monitored_processes[i].name);
+               strcat(fullFileName, local_procs[i].name);
                strcat(fullFileName, ".dat");
                pr_info("[TaskXT] File to write: %s\n", fullFileName);
                log_to_file("[TaskXT] File to write");
@@ -643,29 +711,26 @@ static int extract_features(void*n)
                   cleanup();
                } else {
                   pr_info("[TaskXT] Starting data write for %s (cnt=%d samples)\n", 
-                          monitored_processes[i].name, monitored_processes[i].data.cnt);
-                  err = writeFormatData(&monitored_processes[i].data);
+                          local_procs[i].name, local_procs[i].data.cnt);
+                  err = writeFormatData(&local_procs[i].data);
                   if (err) {
                      pr_err("[TaskXT] Write Error: %d\n", err);
                      log_to_file("[TaskXT] Write Error");
                   } else {
-                     pr_info("[TaskXT] Data write complete for %s\n", monitored_processes[i].name);
+                     pr_info("[TaskXT] Data write complete for %s\n", local_procs[i].name);
                      log_to_file("[TaskXT] Data write complete");
                   }
                   cleanup();
                }
 
                // Reset this process's data and mark as handled
-               monitored_processes[i].data.cnt = 0;
-               monitored_processes[i].data.pid[0] = 0;
+               local_procs[i].data.cnt = 0;
+               local_procs[i].data.pid[0] = 0;
                memset(prev_process, 0, sizeof(prev_process));
             }
          }
-         
-         spin_unlock(&process_lock);
       }
    }
- 
    DBG("Leaving extract_features");
    return 0;
 }
@@ -688,7 +753,6 @@ static int writeFormatData(task_features *tf)
       log_to_file("[TaskXT] WARNING: No samples collected");
       return -EINVAL;
    }
-   
 
    for (i=0; i< loop; i++) {
       cnt = i * sizeof(val);
@@ -799,240 +863,4 @@ static int taskActive(char *pname)
 
    return flag;
 }
-
-/*
-static int runExtractor(void*none)
-{
-   int len =0; 
-   int err = 0;
-
-   fileOpen = 1;   
-   sampling = 1;
-
-    DBG("In runExtractor");
-   err = extract_features(pname);
-   if (err) return err;
-
-
-   // Open file to save samples
-   len = strlen(path);	
-   strcpy(fullFileName, path);
-   if (fullFileName[len-1] != '/') strcat(fullFileName, "/");
-   strcat(fullFileName, pname);
-   strcat(fullFileName, ".dat");
-   printk(KERN_INFO "File to Open: %s\n", fullFileName);
-   filepath = fullFileName; // set for disk write code
- 
-   // open file to save samples use path when driver started and set process name as file name .dat
-   DBG("Initilizing Dump...");
-   if((err = setup())) {
-      DBG("Setup Error");
-      cleanup();
-      return err;
-   }
-
-   err = writeFormatData();
-
-
-   // close file if open
-      cleanup();  // close sample file
-      fileOpen = 0;
-      sampling = 0;
-
-
-    do_exit(0);
-    return 0;
-   //return err;
-}
-
-static int extract_features(void)
-{
-task_features tf;
-   int err = 0;
-   struct task_struct *task = current; // getting global current pointer
-
- //    struct task_struct *task = current; // getting global current pointer
-      printk(KERN_NOTICE "assignment: current process: %s, PID: %d", task->comm, task->pid);
-        do
-        {
-           int ux = task->utime;
-           int sx = task->stime; 
-           strcpy(tf.pid, task->comm);
-//         sprintf(myString, "%d", i);
-
-           if ((err = write_task_feature(&tf))) {
-              DBG("Error writing header" );
-              break;
-           }
-
-           task = task->parent;
-           printk(KERN_NOTICE "assignment: parent process: %s, PID: %d", task->comm, task->pid);
-        } while (task->pid != 0);
-
- //    cleanup();
-
-    return err;
-
-
-
-}
-
-static int write_task_feature(task_features * tsk) {
-        ssize_t s;
-
-        int ss = strlen(tsk->pid);
-       s = write_vaddr(tsk->pid, ss);
-
-//        s = write_vaddr(tsk, sizeof(task_features));
-
-//        if (s != sizeof(task_features)) {
-        if (s != ss) {
-                DBG("Error sending task features %zd", s);
-                return (int) s;
-        }
-
-        return 0;
-}
-
-static int write_task_feature(task_features * tsk) {
-        ssize_t s;
-
-        s = write_vaddr(tsk, sizeof(task_features));
-
-        if (s != sizeof(task_features)) {
-                DBG("Error sending task features %zd", s);
-                return (int) s;
-        }
-
-        return 0;
-}
-
-int read_process(char * fname, char *pname) 
-{
-
-// Create variables
-    struct file *f;
-    mm_segment_t fs;
-    int i;
-    // Init the buffer with 0
-    for(i=0;i<PNAME_FILE;i++) pname[i] = 0;
-
-    // To see in /var/log/messages that the module is operating
-    printk(KERN_INFO "My module is loaded\n");
-
-    // I am using Fedora and for the test I have chosen following file
-    // Obviously it is much smaller than the 128 bytes, but hell with it =)
-    f = filp_open(fname, O_RDONLY, 0);
-
-    if(f == NULL)
-        printk(KERN_ALERT "filp_open error!!.\n");
-    else{
-        // Get current segment descriptor
-        fs = get_fs();
-        // Set segment descriptor associated to kernel space
-        set_fs(get_ds());
-        // Read the file
-        f->f_op->read(f, pname, PNAME_FILE, &f->f_pos);
-        // Restore segment descriptor
-        set_fs(fs);
-        // See what we read from file
-        printk(KERN_INFO "buf:%s\n",pname);
-    }
-    filp_close(f,NULL);
-    return 0;
-}
-       // fpu_counter - > uage counter floatin point units (not available since version linux 2.13)
-
-
-       // Memory related features
-       // map_count -> number of memory regions of a process
-         sprintf(buffer, "%d", (int) (*task->active_mm).map_count);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-       // page_table_lock -> used to mange the page table entries
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).page_table_lock.rlock.raw_lock.tickets.head);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-
-        // hiwater_rss -> Max number of page frames ever owned by the process
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).hiwater_rss);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-        // hiwater_vm -> Max number of pages appeared in memory region of process
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).hiwater_vm);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-        // total_vm -> Size of process's address space in terms of number of pages
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).total_vm);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-        // shared_vm -> Number of pages in shared file memory mappings of process
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).shared_vm);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-        // exec_vm -> number of pages in executable memory mappings of process
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).exec_vm);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-        // nr_ptes -> number of pages tables of a process
-         sprintf(buffer, "%lu", (unsigned long) (*task->active_mm).nr_ptes.counter);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-         // utime -> Tick count of a process that is executing in user mode
-         sprintf(buffer, "%ld", (long int)task->utime);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-         // stime -> Tick count of a process in the kernel mode
-         sprintf(buffer, "%ld", (long int)task->stime);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-        // nvcsw -> number of volunter context switches
-         sprintf(buffer, "%lu", (unsigned long) task->nvcsw);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-	
-	// nivcsw -> number of in-volunter context switches
-         sprintf(buffer, "%lu", (unsigned long)task->nivcsw);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-	// min_flt -> Contains the minor page faults
-         sprintf(buffer, "%lu", (unsigned long)task->min_flt);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-	// alloc_lock.raw_lock.slock -> used to locl memory manager, files and file system etc.
-         sprintf(buffer, "%lu", (unsigned long)task->alloc_lock.rlock.raw_lock.tickets.head);
-         strcat(tf.pid, buffer);
-         strcat(tf.pid, ",");
-
-
-        // fs.count - > number of file usage (was count, now field called users)
-         sprintf(buffer, "%d", (int)(*task->fs).users);
-         strcat(tf.pid, buffer);
-         // strcat(tf.pid, ",");
-         strcat(tf.pid, "\n");
- 
-      }
-
-
-
-*/
-
 
